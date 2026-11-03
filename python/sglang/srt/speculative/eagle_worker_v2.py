@@ -110,6 +110,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    build_target_to_draft_vocab,
     draft_pp_context,
     draft_tp_context,
     fast_sample,
@@ -181,6 +182,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     # (init_attention_backends sets it); a class default, since unit-test harnesses
     # build workers without __init__.
     megakernel: Optional[eagle_megakernel.EagleMegakernel] = None
+    # Rejection sampling with a reduced draft vocabulary: target id -> column of
+    # the draft-vocabulary q, so verify reads q without a scatter. A class
+    # default for subclasses that skip this __init__.
+    target_to_draft_vocab: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -278,20 +283,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         "vocabulary is not supported on a PD-disaggregation decode "
                         "server."
                     )
+                if not _is_npu:
+                    # The NPU verify kernel reads a target-vocabulary q only.
+                    self.target_to_draft_vocab = build_target_to_draft_vocab(
+                        self.hot_token_id, self.target_vocab_size
+                    )
+                q_layout = (
+                    "read through a target-to-draft id map"
+                    if self.target_to_draft_vocab is not None
+                    else "scattered onto the target vocab"
+                )
                 logger.info(
                     "Rejection sampling with a reduced draft vocabulary "
                     f"({self.hot_token_id.shape[0]} -> {self.target_vocab_size}): q is "
-                    "scattered onto the target vocab through the d2t map, so non-hot "
-                    "target tokens are never proposed and keep their full target "
-                    "probability in the residual."
+                    f"{q_layout}, so non-hot target tokens are never proposed and "
+                    "keep their full target probability in the residual."
                 )
 
     @property
     def draft_probs_vocab_size(self) -> int:
         """Width of ``draft_probs`` (q) as it travels between draft steps.
 
-        q stays in the draft head's vocabulary until _build_verify_draft_probs
-        scatters it into the target vocabulary, so every buffer that carries it
+        q stays in the draft head's vocabulary through verify (or until
+        _build_verify_draft_probs scatters it into the target vocabulary when no
+        target-to-draft id map exists), so every buffer that carries it
         across steps -- the draft CUDA-graph input and the idle stub -- is this
         wide, not the target's.
         """
@@ -768,6 +783,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if verify_input.draft_probs is not None:
+            verify_input.target_to_draft_vocab = self.target_to_draft_vocab
         if iteration_ids is not None:
             # Verify and draft extend write the window the draft planned.
             verify_input.iteration_ids = iteration_ids
@@ -985,9 +1002,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         sampled from; the verify kernel reads row ``step - 1`` for slot ``step``,
         so the list order must not be disturbed.
 
-        The kernel indexes q by target token id, so a reduced draft vocabulary is
-        scattered into the target vocabulary here -- once, at the kernel boundary,
-        rather than on every producer.
+        A reduced draft vocabulary keeps q in the draft vocabulary: the verify
+        kernel reads it through ``target_to_draft_vocab``. Without that map, q is
+        scattered into the target vocabulary here -- once, at the kernel
+        boundary, rather than on every producer.
 
         ``draft_probs_list`` is None whenever the proposal distribution was never
         collected -- rejection sampling off, or an all-greedy batch that verifies
@@ -998,9 +1016,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         draft_probs = torch.stack(draft_probs_list, dim=1)
         if self.hot_token_id is None:
             return draft_probs
-        draft_probs = scatter_draft_probs_to_target_vocab(
-            draft_probs, self.hot_token_id, self.target_vocab_size
-        )
+        if self.target_to_draft_vocab is None:
+            draft_probs = scatter_draft_probs_to_target_vocab(
+                draft_probs, self.hot_token_id, self.target_vocab_size
+            )
+        else:
+            # fp32 like the scatter, so eager and CUDA-graph verify see one dtype.
+            draft_probs = draft_probs.to(torch.float32)
         # Every proposed token was drawn from its own row of q, so q > 0 there. A
         # misaligned or mis-scattered q shows up as q == 0, which makes the
         # `coin * q < p` accept test vacuously true: accept length pins to
@@ -1008,12 +1030,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # production. Rows with no mass are CUDA-graph filler -- capture warms up
         # on the zeroed q buffer and replay zeroes the padded rows -- so skip them.
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            proposed_cols = draft_tokens.to(torch.int64)
+            if self.target_to_draft_vocab is not None:
+                proposed_cols = self.target_to_draft_vocab[proposed_cols].to(
+                    torch.int64
+                )
             proposed_q = draft_probs.gather(
-                -1, draft_tokens.to(torch.int64).unsqueeze(-1)
+                -1, proposed_cols.clamp(min=0).unsqueeze(-1)
             )
+            in_draft_vocab = proposed_cols.unsqueeze(-1) >= 0
             has_mass = draft_probs.sum(-1, keepdim=True) > 0
             maybe_assert_async(
-                ((proposed_q > 0) | ~has_mass).all(),
+                (((proposed_q > 0) & in_draft_vocab) | ~has_mass).all(),
                 "draft_forward: q == 0 on a proposed draft token; draft_probs rows "
                 "are misaligned with the chain slots or the d2t scatter is wrong",
             )

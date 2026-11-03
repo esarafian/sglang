@@ -1,10 +1,11 @@
 """Unit tests for EAGLE3 rejection sampling with a reduced (hot) draft vocabulary.
 
 The draft head emits ``draft_vocab_size`` columns and ``hot_token_id`` maps them
-onto target token ids, so ``q`` has to be lifted to the target vocabulary before
-the chain kernel -- which indexes ``q`` by target token id -- can read it.
-``eagle_utils`` rejects a ``draft_probs`` whose last dim does not match
-``target_probs``, so the width contract is what these tests pin down.
+onto target token ids. The chain kernel indexes ``q`` by target token id, so it
+reads ``q`` through a target-to-draft id map, or ``q`` is scattered into the
+target vocabulary first when no such map exists. ``eagle_utils`` rejects a
+``draft_probs`` that matches neither layout, so the width contract is what these
+tests pin down.
 """
 
 import unittest
@@ -13,7 +14,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-from sglang.srt.speculative.spec_utils import scatter_draft_probs_to_target_vocab
+from sglang.srt.speculative.spec_utils import (
+    build_target_to_draft_vocab,
+    scatter_draft_probs_to_target_vocab,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -132,6 +136,7 @@ class TestVerifyDraftProbsAssert(CustomTestCase):
         self.worker = object.__new__(EagleDraftWorker)
         self.worker.hot_token_id = torch.tensor([1, 3, 4, 9, 15], dtype=torch.int64)
         self.worker.target_vocab_size = 16
+        self.expected_width = 16
         # Two requests, three chain slots; slot i's token is drawn from row i.
         self.rows = [torch.full((2, 5), 0.2) for _ in range(3)]
         self.draft_tokens = self.worker.hot_token_id[
@@ -143,14 +148,55 @@ class TestVerifyDraftProbsAssert(CustomTestCase):
         self.rows[0][1] = 0
         with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
             out = self.worker._build_verify_draft_probs(self.rows, self.draft_tokens)
-        self.assertEqual(out.shape, (2, 3, 16))
+        self.assertEqual(out.shape, (2, 3, self.expected_width))
 
     def test_proposed_token_without_mass_fires(self):
-        # Target id 2 is not hot, so its scattered q is 0 although the row has mass.
+        # Target id 2 is not hot, so its q is 0 although the row has mass.
         self.draft_tokens[0, 1] = 2
         with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
             with self.assertRaises(RuntimeError):
                 self.worker._build_verify_draft_probs(self.rows, self.draft_tokens)
+
+
+class TestVerifyDraftProbsMapped(TestVerifyDraftProbsAssert):
+    """With a target-to-draft id map, q stays in the draft vocabulary."""
+
+    def setUp(self):
+        super().setUp()
+        self.worker.target_to_draft_vocab = build_target_to_draft_vocab(
+            self.worker.hot_token_id, self.worker.target_vocab_size
+        )
+        self.expected_width = 5
+
+    def test_same_q_as_the_scatter(self):
+        rows = [torch.rand(2, 5, dtype=torch.bfloat16) for _ in range(3)]
+        mapped = self.worker._build_verify_draft_probs(rows, self.draft_tokens)
+        self.assertEqual(mapped.dtype, torch.float32)
+        self.worker.target_to_draft_vocab = None
+        scattered = self.worker._build_verify_draft_probs(rows, self.draft_tokens)
+        self.assertTrue(
+            torch.equal(
+                scatter_draft_probs_to_target_vocab(mapped, self.worker.hot_token_id, 16),
+                scattered,
+            )
+        )
+
+
+class TestBuildTargetToDraftVocab(CustomTestCase):
+    def test_maps_each_hot_id_to_its_column(self):
+        hot = torch.tensor([9, 1, 15, 4, 3])
+        target_to_draft = build_target_to_draft_vocab(hot, 16)
+        self.assertEqual(target_to_draft.dtype, torch.int32)
+        self.assertEqual(target_to_draft[hot].tolist(), [0, 1, 2, 3, 4])
+        cold = torch.ones(16, dtype=torch.bool)
+        cold[hot] = False
+        self.assertTrue((target_to_draft[cold] == -1).all())
+
+    def test_rejects_maps_the_scatter_cannot_express(self):
+        for hot in ([1, 3, 3], [-1, 2], [2, 16]):
+            self.assertIsNone(
+                build_target_to_draft_vocab(torch.tensor(hot), 16), msg=str(hot)
+            )
 
 
 if __name__ == "__main__":

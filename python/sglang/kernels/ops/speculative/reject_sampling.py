@@ -3,6 +3,19 @@ import triton.language as tl
 
 
 @triton.jit
+def _load_mapped_draft_q(q_row, token_ids, mask, TargetToDraft, stride_dp_v):
+    """q over a reduced draft vocabulary, read by target token id.
+
+    Target ids outside the draft vocabulary map to -1 and read 0.0, the value a
+    scattered target-vocabulary q holds there.
+    """
+    cols = tl.load(TargetToDraft + token_ids, mask=mask, other=-1)
+    return tl.load(
+        q_row + tl.maximum(cols, 0) * stride_dp_v, mask=mask & (cols >= 0), other=0.0
+    )
+
+
+@triton.jit
 def speculative_sampling_classic_kernel(
     # Pointers
     Predicts,
@@ -14,6 +27,7 @@ def speculative_sampling_classic_kernel(
     UniformSamplesFinal,
     TargetProbs,
     DraftProbs,
+    TargetToDraft,
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -33,6 +47,7 @@ def speculative_sampling_classic_kernel(
     BLOCK_V: tl.constexpr,
     BLOCK_VERIFICATION: tl.constexpr = False,
     BLOCK_REDUCE: tl.constexpr = 4096,
+    MAPPED_Q: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
@@ -62,12 +77,21 @@ def speculative_sampling_classic_kernel(
                 + (step - 1) * stride_tp_s
                 + draft_token * stride_tp_v
             )
-            q = tl.load(
-                DraftProbs
-                + pid * stride_dp_b
-                + (step - 1) * stride_dp_s
-                + draft_token * stride_dp_v
-            )
+            if MAPPED_Q:
+                q = _load_mapped_draft_q(
+                    DraftProbs + pid * stride_dp_b + (step - 1) * stride_dp_s,
+                    draft_token,
+                    draft_token >= 0,
+                    TargetToDraft,
+                    stride_dp_v,
+                )
+            else:
+                q = tl.load(
+                    DraftProbs
+                    + pid * stride_dp_b
+                    + (step - 1) * stride_dp_s
+                    + draft_token * stride_dp_v
+                )
             q_is_prob = (q > 0.0) & (q <= 1.0)
             prefix_prob = tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
             prefix_probs += (prefix_prob,)
@@ -97,14 +121,23 @@ def speculative_sampling_classic_kernel(
                                 mask=mask,
                                 other=0.0,
                             )
-                            q_next = tl.load(
-                                DraftProbs
-                                + pid * stride_dp_b
-                                + step * stride_dp_s
-                                + v_offsets * stride_dp_v,
-                                mask=mask,
-                                other=0.0,
-                            )
+                            if MAPPED_Q:
+                                q_next = _load_mapped_draft_q(
+                                    DraftProbs + pid * stride_dp_b + step * stride_dp_s,
+                                    v_offsets,
+                                    mask,
+                                    TargetToDraft,
+                                    stride_dp_v,
+                                )
+                            else:
+                                q_next = tl.load(
+                                    DraftProbs
+                                    + pid * stride_dp_b
+                                    + step * stride_dp_s
+                                    + v_offsets * stride_dp_v,
+                                    mask=mask,
+                                    other=0.0,
+                                )
                             residual_mass += tl.sum(
                                 tl.maximum(prefix_prob * p_next - q_next, 0.0)
                             )
@@ -137,12 +170,21 @@ def speculative_sampling_classic_kernel(
                 + cur_prob_row * stride_tp_s
                 + draft_token * stride_tp_v
             )
-            q = tl.load(
-                DraftProbs
-                + pid * stride_dp_b
-                + cur_prob_row * stride_dp_s
-                + draft_token * stride_dp_v
-            )
+            if MAPPED_Q:
+                q = _load_mapped_draft_q(
+                    DraftProbs + pid * stride_dp_b + cur_prob_row * stride_dp_s,
+                    draft_token,
+                    draft_token >= 0,
+                    TargetToDraft,
+                    stride_dp_v,
+                )
+            else:
+                q = tl.load(
+                    DraftProbs
+                    + pid * stride_dp_b
+                    + cur_prob_row * stride_dp_s
+                    + draft_token * stride_dp_v
+                )
             coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
             # A proposal token must have positive probability under its draft distribution.
             q_is_prob = (q > 0.0) & (q <= 1.0)
@@ -186,8 +228,13 @@ def speculative_sampling_classic_kernel(
             if all_drafts_accepted:
                 val = p_val
             else:
-                q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
-                q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                if MAPPED_Q:
+                    q_val = _load_mapped_draft_q(
+                        dp_base_ptr_safe, v_offsets, mask, TargetToDraft, stride_dp_v
+                    )
+                else:
+                    q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                    q_val = tl.load(q_ptr, mask=mask, other=0.0)
                 # Treat any non-probability q (NaN, +-inf, negative) as 0: the
                 # residual falls back to p. A comparison against NaN is false, so
                 # the range test rejects it along with the infinities.
@@ -216,8 +263,13 @@ def speculative_sampling_classic_kernel(
             if all_drafts_accepted:
                 val = p_val
             else:
-                q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
-                q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                if MAPPED_Q:
+                    q_val = _load_mapped_draft_q(
+                        dp_base_ptr_safe, v_offsets, mask, TargetToDraft, stride_dp_v
+                    )
+                else:
+                    q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                    q_val = tl.load(q_ptr, mask=mask, other=0.0)
                 # Same guard as pass 1.
                 q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
                 diff = residual_scale * p_val - q_val
@@ -256,7 +308,14 @@ def chain_speculative_sampling_triton(
     deterministic,  # not used
     *,
     block_verification: bool = False,
+    target_to_draft_vocab=None,
 ):
+    """Chain rejection sampling (one program per request).
+
+    ``draft_probs`` is q over the target vocabulary, or over a reduced draft
+    vocabulary when ``target_to_draft_vocab`` (int32, one entry per target id:
+    its column in ``draft_probs``, -1 if absent) is given.
+    """
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
     # Keep CDF tiles small, and cap multi-tile reductions to avoid register spills.
@@ -274,6 +333,7 @@ def chain_speculative_sampling_triton(
         uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
+        target_to_draft_vocab if target_to_draft_vocab is not None else draft_probs,
         candidates.stride(0),
         candidates.stride(1),
         retrive_index.stride(0),
@@ -291,5 +351,6 @@ def chain_speculative_sampling_triton(
         BLOCK_V=4096,
         BLOCK_VERIFICATION=block_verification,
         BLOCK_REDUCE=block_reduce,
+        MAPPED_Q=target_to_draft_vocab is not None,
         num_warps=num_warps,
     )

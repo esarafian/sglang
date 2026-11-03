@@ -2,14 +2,14 @@
 
 The Llama-3.1 EAGLE3 draft emits 32000 logits against a 128256-token target.
 Rejection sampling carries each step's q at the draft width, through the decode
-CUDA graph and the overlap future map, and scatters it onto the target
-vocabulary through the d2t map only at verify. A q buffer sized for the target
+CUDA graph and the overlap future map, and verify reads it there through a
+target-to-draft id map built from d2t. A q buffer sized for the target
 vocabulary fails graph capture on its first torch.stack.
 
-SGLANG_ENABLE_ASYNC_ASSERT turns a misaligned scatter (q == 0 on a proposed
-token) into a crash instead of an inflated accept length. Greedy requests verify
-by argmax and never build q, so test_sampled_batch sends sampled requests, nine
-of them so the decode batch pads to the next captured size.
+SGLANG_ENABLE_ASYNC_ASSERT turns a misaligned q (q == 0 on a proposed token)
+into a crash instead of an inflated accept length. Greedy requests verify by
+argmax and never build q, so test_sampled_batch sends sampled requests, nine of
+them so the decode batch pads to the next captured size.
 """
 
 import unittest

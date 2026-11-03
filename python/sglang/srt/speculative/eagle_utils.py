@@ -777,6 +777,11 @@ def eagle_sample(
     else:
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
+            if verify_input.target_to_draft_vocab is not None:
+                sampling_fn = partial(
+                    sampling_fn,
+                    target_to_draft_vocab=verify_input.target_to_draft_vocab,
+                )
             if get_spec().speculative_use_block_verification:
                 sampling_fn = partial(sampling_fn, block_verification=True)
         else:
@@ -811,10 +816,16 @@ def eagle_sample(
             else torch.zeros_like(target_probs)
         )
         # Defense-in-depth behind the spec_hook startup allowlist: validate
-        # the actual kernel inputs before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
+        # the actual kernel inputs before the Triton kernel. q is indexed by
+        # target id, directly or through target_to_draft_vocab.
+        q_target_width = None
+        if draft_probs is not None:
+            q_target_width = (
+                draft_probs.shape[-1]
+                if verify_input.target_to_draft_vocab is None
+                else verify_input.target_to_draft_vocab.shape[0]
+            )
+        if use_rejection_sampling and q_target_width != target_probs.shape[-1]:
             raise ValueError(
                 "Rejection sampling requires a target-vocab draft proposal "
                 "distribution; the current speculative algorithm/draft worker "

@@ -44,7 +44,7 @@ def _should_auto_enable_hip_rejection_sampling(
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
     Rejection sampling can now consume a reduced / hot draft vocab --
-    ``eagle_worker_v2`` scatters ``q`` onto the target vocab through the d2t map
+    verify reads the draft-vocabulary ``q`` by target id through the d2t map
     -- but that path is not validated on ROCm, so auto-enabling is still withheld
     for EAGLE3 and for any EAGLE run that already has a token map. Passing the
     flag explicitly works.

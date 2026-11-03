@@ -34,6 +34,9 @@ class EagleVerifyInput(SpecInput):
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+    # Set when draft_probs stays in a reduced draft vocabulary: int32 (target
+    # vocab,) column of each target token id in draft_probs, -1 if absent.
+    target_to_draft_vocab: Optional[torch.Tensor] = None
     prepared_out_cache_loc: Optional[torch.Tensor] = None
     prepared_mrope_positions: Optional[torch.Tensor] = None
     # The iteration's plan when the draft planned the verify window

@@ -302,6 +302,32 @@ def scatter_draft_probs_to_target_vocab(
     return out
 
 
+def build_target_to_draft_vocab(
+    hot_token_id: torch.Tensor, target_vocab_size: int
+) -> Optional[torch.Tensor]:
+    """Map each target token id to its column in a reduced-vocabulary ``q``.
+
+    Returns an int32 ``(target_vocab_size,)`` tensor holding -1 for target ids
+    outside the draft vocabulary. The verify kernel reads ``q`` through it, so
+    ``q`` never has to be scattered into the target vocabulary. Returns None
+    when ``hot_token_id`` is not a set of distinct in-range target ids, because
+    the scattered ``q`` is then not well defined; callers keep the scatter.
+    """
+    num_hot = hot_token_id.shape[0]
+    hot = hot_token_id.to(torch.int64)
+    if (
+        int(hot.min()) < 0
+        or int(hot.max()) >= target_vocab_size
+        or torch.unique(hot).numel() != num_hot
+    ):
+        return None
+    target_to_draft = torch.full(
+        (target_vocab_size,), -1, dtype=torch.int32, device=hot.device
+    )
+    target_to_draft[hot] = torch.arange(num_hot, dtype=torch.int32, device=hot.device)
+    return target_to_draft
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
