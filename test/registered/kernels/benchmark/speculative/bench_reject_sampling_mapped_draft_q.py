@@ -48,7 +48,7 @@ def _make_case(batch_size: int, target_vocab: int):
 
 
 @marker.parametrize("target_vocab", [151936, 248320], [151936])
-@marker.parametrize("batch_size", [1, 16, 64, 128], [16, 64])
+@marker.parametrize("batch_size", [1, 4, 16, 32, 64, 128], [16, 64])
 @marker.benchmark("impl", ["scatter", "mapped"])
 def benchmark(target_vocab: int, batch_size: int, impl: str):
     hot, q, target, candidates, coins, final_coins = _make_case(

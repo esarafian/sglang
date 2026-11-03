@@ -3,16 +3,31 @@ import triton.language as tl
 
 
 @triton.jit
-def _load_mapped_draft_q(q_row, token_ids, mask, TargetToDraft, stride_dp_v):
-    """q over a reduced draft vocabulary, read by target token id.
+def _gather_draft_q(q_row, cols, mask, stride_dp_v):
+    """q over a reduced draft vocabulary at draft columns ``cols``.
 
-    Target ids outside the draft vocabulary map to -1 and read 0.0, the value a
+    Column -1 (a target id outside the draft vocabulary) reads 0.0, the value a
     scattered target-vocabulary q holds there.
     """
-    cols = tl.load(TargetToDraft + token_ids, mask=mask, other=-1)
     return tl.load(
         q_row + tl.maximum(cols, 0) * stride_dp_v, mask=mask & (cols >= 0), other=0.0
     )
+
+
+@triton.jit
+def _load_mapped_draft_q(q_row, token_ids, mask, TargetToDraft, stride_dp_v):
+    """q over a reduced draft vocabulary, read by target token id."""
+    cols = tl.load(TargetToDraft + token_ids, mask=mask, other=-1)
+    return _gather_draft_q(q_row, cols, mask, stride_dp_v)
+
+
+@triton.jit
+def _load_cols_tile(
+    TargetToDraft, v_start, VOCAB_SIZE: tl.constexpr, BLOCK_V: tl.constexpr
+):
+    """Draft columns of target ids [v_start, v_start + BLOCK_V); -1 past the end."""
+    v_offsets = v_start + tl.arange(0, BLOCK_V)
+    return tl.load(TargetToDraft + v_offsets, mask=v_offsets < VOCAB_SIZE, other=-1)
 
 
 @triton.jit
@@ -218,20 +233,27 @@ def speculative_sampling_classic_kernel(
     if norm_sum < 0.0:
         norm_sum = 0.0
         # Pass 1: Sum
+        if MAPPED_Q:
+            # Load each tile's draft columns one tile ahead, so that only the q
+            # gather waits on memory, as the plain q load does.
+            next_cols = _load_cols_tile(TargetToDraft, 0, VOCAB_SIZE, BLOCK_V)
         for v_start in range(0, VOCAB_SIZE, BLOCK_V):
             v_offsets = v_start + tl.arange(0, BLOCK_V)
             mask = v_offsets < VOCAB_SIZE
 
             p_ptr = tp_base_ptr + v_offsets * stride_tp_v
             p_val = tl.load(p_ptr, mask=mask, other=0.0)
+            if MAPPED_Q:
+                cols = next_cols
+                next_cols = _load_cols_tile(
+                    TargetToDraft, v_start + BLOCK_V, VOCAB_SIZE, BLOCK_V
+                )
 
             if all_drafts_accepted:
                 val = p_val
             else:
                 if MAPPED_Q:
-                    q_val = _load_mapped_draft_q(
-                        dp_base_ptr_safe, v_offsets, mask, TargetToDraft, stride_dp_v
-                    )
+                    q_val = _gather_draft_q(dp_base_ptr_safe, cols, mask, stride_dp_v)
                 else:
                     q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                     q_val = tl.load(q_ptr, mask=mask, other=0.0)
@@ -252,6 +274,8 @@ def speculative_sampling_classic_kernel(
     final_token = VOCAB_SIZE - 1
     found = 0
 
+    if MAPPED_Q:
+        next_cols = _load_cols_tile(TargetToDraft, 0, VOCAB_SIZE, BLOCK_V)
     for v_start in range(0, VOCAB_SIZE, BLOCK_V):
         if found == 0:
             v_offsets = v_start + tl.arange(0, BLOCK_V)
@@ -259,14 +283,17 @@ def speculative_sampling_classic_kernel(
 
             p_ptr = tp_base_ptr + v_offsets * stride_tp_v
             p_val = tl.load(p_ptr, mask=mask, other=0.0)
+            if MAPPED_Q:
+                cols = next_cols
+                next_cols = _load_cols_tile(
+                    TargetToDraft, v_start + BLOCK_V, VOCAB_SIZE, BLOCK_V
+                )
 
             if all_drafts_accepted:
                 val = p_val
             else:
                 if MAPPED_Q:
-                    q_val = _load_mapped_draft_q(
-                        dp_base_ptr_safe, v_offsets, mask, TargetToDraft, stride_dp_v
-                    )
+                    q_val = _gather_draft_q(dp_base_ptr_safe, cols, mask, stride_dp_v)
                 else:
                     q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                     q_val = tl.load(q_ptr, mask=mask, other=0.0)
