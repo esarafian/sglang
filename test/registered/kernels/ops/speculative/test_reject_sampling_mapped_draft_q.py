@@ -114,10 +114,10 @@ def test_mapped_q_matches_scattered_q(
         block,
         None,
     )
-    mapped = _run(
-        target, q, candidates, coins, final_coins, block, target_to_draft
-    )
-    for name, expected, actual in zip(("predicts", "accepted", "lengths"), dense, mapped):
+    mapped = _run(target, q, candidates, coins, final_coins, block, target_to_draft)
+    for name, expected, actual in zip(
+        ("predicts", "accepted", "lengths"), dense, mapped
+    ):
         assert torch.equal(expected, actual), name
     # Row 0 proposes a token outside the draft vocabulary, so it rejects at once;
     # the other rows must reach the accept branch.

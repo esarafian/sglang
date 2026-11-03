@@ -176,7 +176,9 @@ class TestVerifyDraftProbsMapped(TestVerifyDraftProbsAssert):
         scattered = self.worker._build_verify_draft_probs(rows, self.draft_tokens)
         self.assertTrue(
             torch.equal(
-                scatter_draft_probs_to_target_vocab(mapped, self.worker.hot_token_id, 16),
+                scatter_draft_probs_to_target_vocab(
+                    mapped, self.worker.hot_token_id, 16
+                ),
                 scattered,
             )
         )
