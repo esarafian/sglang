@@ -191,6 +191,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             retrieve_next_token=torch.zeros((1, 2), dtype=torch.int32),
             retrieve_next_sibling=torch.zeros((1, 2), dtype=torch.int32),
             draft_probs=None,
+            target_to_draft_vocab=None,
         )
         sampling_info = SimpleNamespace(
             acc_additive_penalties=None,
